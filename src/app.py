@@ -5,11 +5,21 @@ A FastAPI application that enables Slalom consultants to register their
 capabilities and manage consulting expertise across the organization.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from datetime import datetime
+
+from models import (
+    UserRegistration, UserLogin, UserResponse, 
+    TokenResponse, CapabilityRegistration
+)
+from auth import (
+    get_password_hash, verify_password, 
+    create_access_token, get_current_user
+)
 
 app = FastAPI(title="Slalom Capabilities Management API",
               description="API for managing consulting capabilities and consultant expertise")
@@ -18,6 +28,9 @@ app = FastAPI(title="Slalom Capabilities Management API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# In-memory user database (password should be hashed)
+users = {}
 
 # In-memory capabilities database
 capabilities = {
@@ -115,9 +128,106 @@ def get_capabilities():
     return capabilities
 
 
+# ============================================================================
+# Authentication Endpoints
+# ============================================================================
+
+@app.post("/auth/register", response_model=UserResponse)
+def register_user(user: UserRegistration):
+    """Register a new user with email and password"""
+    # Check if user already exists
+    if user.email in users:
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered"
+        )
+    
+    # Hash the password
+    hashed_password = get_password_hash(user.password)
+    
+    # Store user (in production, this would go to a database)
+    users[user.email] = {
+        "email": user.email,
+        "password_hash": hashed_password,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    
+    return UserResponse(
+        email=user.email,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        created_at=users[user.email]["created_at"]
+    )
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login_user(credentials: UserLogin):
+    """Login and receive a JWT token"""
+    # Check if user exists
+    if credentials.email not in users:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+    
+    user = users[credentials.email]
+    
+    # Verify password
+    if not verify_password(credentials.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+    
+    # Create access token
+    access_token = create_access_token(data={"sub": user["email"]})
+    
+    return TokenResponse(
+        access_token=access_token,
+        user=UserResponse(
+            email=user["email"],
+            first_name=user["first_name"],
+            last_name=user["last_name"],
+            created_at=user["created_at"]
+        )
+    )
+
+
+@app.get("/auth/me", response_model=UserResponse)
+def get_current_user_info(current_user_email: str = Depends(get_current_user)):
+    """Get current authenticated user information"""
+    if current_user_email not in users:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+    
+    user = users[current_user_email]
+    return UserResponse(
+        email=user["email"],
+        first_name=user["first_name"],
+        last_name=user["last_name"],
+        created_at=user["created_at"]
+    )
+
+
+# ============================================================================
+# Protected Capability Endpoints
+# ============================================================================
+
+
 @app.post("/capabilities/{capability_name}/register")
-def register_for_capability(capability_name: str, email: str):
-    """Register a consultant for a capability"""
+def register_for_capability(
+    capability_name: str,
+    current_user_email: str = Depends(get_current_user)
+):
+    """Register the authenticated user for a capability"""
+    # Validate user exists
+    if current_user_email not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    
     # Validate capability exists
     if capability_name not in capabilities:
         raise HTTPException(status_code=404, detail="Capability not found")
@@ -126,20 +236,23 @@ def register_for_capability(capability_name: str, email: str):
     capability = capabilities[capability_name]
 
     # Validate consultant is not already registered
-    if email in capability["consultants"]:
+    if current_user_email in capability["consultants"]:
         raise HTTPException(
             status_code=400,
-            detail="Consultant is already registered for this capability"
+            detail="You are already registered for this capability"
         )
 
     # Add consultant
-    capability["consultants"].append(email)
-    return {"message": f"Registered {email} for {capability_name}"}
+    capability["consultants"].append(current_user_email)
+    return {"message": f"Registered {current_user_email} for {capability_name}"}
 
 
 @app.delete("/capabilities/{capability_name}/unregister")
-def unregister_from_capability(capability_name: str, email: str):
-    """Unregister a consultant from a capability"""
+def unregister_from_capability(
+    capability_name: str,
+    current_user_email: str = Depends(get_current_user)
+):
+    """Unregister the authenticated user from a capability"""
     # Validate capability exists
     if capability_name not in capabilities:
         raise HTTPException(status_code=404, detail="Capability not found")
@@ -148,12 +261,12 @@ def unregister_from_capability(capability_name: str, email: str):
     capability = capabilities[capability_name]
 
     # Validate consultant is registered
-    if email not in capability["consultants"]:
+    if current_user_email not in capability["consultants"]:
         raise HTTPException(
             status_code=400,
-            detail="Consultant is not registered for this capability"
+            detail="You are not registered for this capability"
         )
 
     # Remove consultant
-    capability["consultants"].remove(email)
-    return {"message": f"Unregistered {email} from {capability_name}"}
+    capability["consultants"].remove(current_user_email)
+    return {"message": f"Unregistered {current_user_email} from {capability_name}"}
